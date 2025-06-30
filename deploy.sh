@@ -2,7 +2,7 @@
 
 # CiviCRM Hardened Deployment Script for DigitalOcean (Ubuntu 22.04 LTS)
 # This script automates the installation of LAMP (Apache, MariaDB, PHP),
-# WordPress, and CiviCRM, with enhanced security considerations.
+# WordPress, and CiviCRM, with enhanced security considerations for APT threats.
 
 echo "==============================================="
 echo " CiviCRM Hardened Deployment Script"
@@ -76,24 +76,43 @@ echo ""
 
 # --- 5. Secure MariaDB Installation ---
 echo "--- Securing MariaDB ---"
-# Set MariaDB root password and configure security
-sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$DB_ROOT_PASS';"
+
+# Escape single quotes in the MariaDB root password for SQL syntax
+# This handles passwords containing single quotes, which caused the previous error.
+ESCAPED_DB_ROOT_PASS=$(printf '%s' "$DB_ROOT_PASS" | sed "s/'/''/g")
+
+# Set MariaDB root password
+sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$ESCAPED_DB_ROOT_PASS';"
 if [ $? -ne 0 ]; then echo "Error setting MariaDB root password. Exiting."; exit 1; fi
 
 # Run mysql_secure_installation steps programmatically
 # Note: For production, consider running `mysql_secure_installation` manually for full prompts.
-sudo mysql -u root -p"$DB_ROOT_PASS" -e "DELETE FROM mysql.user WHERE User=''; FLUSH PRIVILEGES;"
-sudo mysql -u root -p"$DB_ROOT_PASS" -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'); FLUSH PRIVILEGES;"
-sudo mysql -u root -p"$DB_ROOT_PASS" -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'; FLUSH PRIVILEGES;"
-sudo mysql -u root -p"$DB_ROOT_PASS" -e "FLUSH PRIVILEGES;"
+# Using a temporary file for password to avoid exposing it in history/process list for subsequent commands
+echo "[client]" > ~/.my.cnf
+echo "user=root" >> ~/.my.cnf
+echo "password=$DB_ROOT_PASS" >> ~/.my.cnf
+chmod 600 ~/.my.cnf
+
+sudo mysql --defaults-extra-file=~/.my.cnf -e "DELETE FROM mysql.user WHERE User=''; FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file=~/.my.cnf -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'); FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file=~/.my.cnf -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'; FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file=~/.my.cnf -e "FLUSH PRIVILEGES;"
+
+# Clean up temporary password file
+rm ~/.my.cnf
+
 echo "MariaDB basic security measures applied."
 echo ""
 
 # --- 6. Create Database and User for CiviCRM/WordPress ---
 echo "--- Creating database and user for CiviCRM/WordPress ---"
+# Escape single quotes in the CiviCRM/WordPress database password for SQL syntax
+ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
+
 sudo mysql -u root -p"$DB_ROOT_PASS" <<MYSQL_SCRIPT
 CREATE DATABASE $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$ESCAPED_DB_PASS';
+GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 MYSQL_SCRIPT
 if [ $? -ne 0 ]; then echo "Error creating database or user. Exiting."; exit 1; fi
