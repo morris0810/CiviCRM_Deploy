@@ -1,8 +1,96 @@
 #!/bin/bash
+set -euo pipefail
 
 # CiviCRM Hardened Deployment Script for DigitalOcean (Ubuntu 22.04 LTS)
 # This script automates the installation of LAMP (Apache, MariaDB, PHP),
 # WordPress, and CiviCRM, with enhanced security considerations for APT threats.
+
+MYSQL_ROOT_CNF=""
+cleanup() {
+    if [[ -n "${MYSQL_ROOT_CNF:-}" && -f "$MYSQL_ROOT_CNF" ]]; then
+        shred -u "$MYSQL_ROOT_CNF" 2>/dev/null || rm -f "$MYSQL_ROOT_CNF"
+    fi
+}
+trap cleanup EXIT
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+is_yes() {
+    [[ "$1" =~ ^[Yy][Ee][Ss]$ ]]
+}
+
+validate_mysql_identifier() {
+    local value="$1"
+    local label="$2"
+    [[ "$value" =~ ^[A-Za-z0-9_]+$ ]] || fail "$label may only contain letters, numbers, and underscores."
+}
+
+validate_domain_or_ip() {
+    local value="$1"
+    [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ || "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "Domain/IP contains invalid characters."
+}
+
+validate_port() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] || fail "SSH port must be numeric."
+    (( value >= 1 && value <= 65535 )) || fail "SSH port must be between 1 and 65535."
+}
+
+validate_ssh_sources() {
+    local sources="$1"
+    local source
+    [[ -z "$sources" ]] && return 0
+    IFS=',' read -ra ADDRS <<< "$sources"
+    for source in "${ADDRS[@]}"; do
+        source="${source//[[:space:]]/}"
+        [[ "$source" =~ ^[A-Fa-f0-9:.]+(/[0-9]{1,3})?$ ]] || fail "Invalid SSH trusted IP/CIDR value: $source"
+    done
+}
+
+write_mysql_root_cnf() {
+    MYSQL_ROOT_CNF=$(mktemp)
+    chmod 600 "$MYSQL_ROOT_CNF"
+    {
+        echo "[client]"
+        echo "user=root"
+        echo "password=$DB_ROOT_PASS"
+    } > "$MYSQL_ROOT_CNF"
+}
+
+download_with_sha256() {
+    local url="$1"
+    local checksum_url="$2"
+    local checksum_pattern="$3"
+    local destination="$4"
+    local checksum_file
+    local expected_hash
+
+    checksum_file=$(mktemp)
+    curl -fsSL "$url" -o "$destination"
+    curl -fsSL "$checksum_url" -o "$checksum_file"
+    expected_hash=$(awk -v pattern="$checksum_pattern" '$0 ~ pattern {print $1; exit}' "$checksum_file")
+    [[ -n "$expected_hash" ]] || fail "Could not find checksum for $checksum_pattern."
+    echo "$expected_hash  $(basename "$destination")" > "$destination.sha256"
+    (cd "$(dirname "$destination")" && sha256sum -c "$(basename "$destination").sha256")
+    rm -f "$checksum_file" "$destination.sha256"
+}
+
+download_wp_cli() {
+    local wp_cli_tmp="/tmp/wp-cli.phar"
+    local checksum_tmp="/tmp/wp-cli.phar.sha512"
+    local expected_hash
+
+    curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$wp_cli_tmp"
+    curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar.sha512 -o "$checksum_tmp"
+    expected_hash=$(awk '{print $1}' "$checksum_tmp")
+    echo "$expected_hash  $wp_cli_tmp" | sha512sum -c -
+    chmod +x "$wp_cli_tmp"
+    sudo mv "$wp_cli_tmp" /usr/local/bin/wp
+    rm -f "$checksum_tmp"
+}
 
 echo "==============================================="
 echo " CiviCRM Hardened Deployment Script"
@@ -16,33 +104,40 @@ echo ""
 # --- 1. User Input for Configuration ---
 echo "--- Configuration ---"
 
-read -p "Enter your desired WordPress Site Title (e.g., My Secure CiviCRM Site): " WP_SITE_TITLE
-read -p "Enter your desired WordPress Admin Username: " WP_ADMIN_USER
-read -s -p "Enter your desired WordPress Admin Password: " WP_ADMIN_PASS
+read -r -p "Enter your desired WordPress Site Title (e.g., My Secure CiviCRM Site): " WP_SITE_TITLE
+read -r -p "Enter your desired WordPress Admin Username: " WP_ADMIN_USER
+read -r -s -p "Enter your desired WordPress Admin Password: " WP_ADMIN_PASS
 echo
-read -p "Enter your WordPress Admin Email: " WP_ADMIN_EMAIL
+read -r -p "Enter your WordPress Admin Email: " WP_ADMIN_EMAIL
 
 echo ""
 echo "--- Database Configuration for MariaDB ---"
-read -p "Enter your desired MariaDB Root Password: " DB_ROOT_PASS
-read -p "Enter your desired CiviCRM/WordPress Database Name (e.g., secure_civicrm_db): " DB_NAME
-read -p "Enter your desired CiviCRM/WordPress Database User (e.g., secure_civicrm_user): " DB_USER
-read -s -p "Enter your desired CiviCRM/WordPress Database Password: " DB_PASS
+read -r -s -p "Enter your desired MariaDB Root Password: " DB_ROOT_PASS
+echo
+read -r -p "Enter your desired CiviCRM/WordPress Database Name (e.g., secure_civicrm_db): " DB_NAME
+read -r -p "Enter your desired CiviCRM/WordPress Database User (e.g., secure_civicrm_user): " DB_USER
+read -r -s -p "Enter your desired CiviCRM/WordPress Database Password: " DB_PASS
 echo
 
 echo ""
-read -p "Enter your domain name (e.g., example.com) or droplet IP if no domain: " DOMAIN_OR_IP
+read -r -p "Enter your domain name (e.g., example.com) or droplet IP if no domain: " DOMAIN_OR_IP
 echo ""
 
 echo "--- SSH Security Configuration ---"
 echo "IMPORTANT: For APT defense, SSH access should be highly restricted."
-read -p "Enter trusted IP addresses for SSH access (comma-separated, e.g., 203.0.113.1,198.51.100.0/24). Leave blank to allow all (NOT RECOMMENDED for APT defense): " SSH_TRUSTED_IPS
-read -p "Change default SSH port (22) to a non-standard port? (yes/no): " CHANGE_SSH_PORT
+read -r -p "Enter trusted IP addresses for SSH access (comma-separated, e.g., 203.0.113.1,198.51.100.0/24). Leave blank to allow all (NOT RECOMMENDED for APT defense): " SSH_TRUSTED_IPS
+read -r -p "Change default SSH port (22) to a non-standard port? (yes/no): " CHANGE_SSH_PORT
 NEW_SSH_PORT=22
-if [[ "$CHANGE_SSH_PORT" =~ ^[Yy][Ee][Ss]$ ]]; then
-    read -p "Enter new SSH port (e.g., 2222): " NEW_SSH_PORT
+if is_yes "$CHANGE_SSH_PORT"; then
+    read -r -p "Enter new SSH port (e.g., 2222): " NEW_SSH_PORT
 fi
-read -p "Disable password authentication for SSH (RECOMMENDED - only SSH keys)? (yes/no): " DISABLE_SSH_PASSWORD
+read -r -p "Disable password authentication for SSH (RECOMMENDED - only SSH keys)? (yes/no): " DISABLE_SSH_PASSWORD
+
+validate_mysql_identifier "$DB_NAME" "Database name"
+validate_mysql_identifier "$DB_USER" "Database user"
+validate_domain_or_ip "$DOMAIN_OR_IP"
+validate_port "$NEW_SSH_PORT"
+validate_ssh_sources "$SSH_TRUSTED_IPS"
 
 echo ""
 echo "Starting hardened deployment. This may take some time..."
@@ -51,7 +146,8 @@ echo "Starting hardened deployment. This may take some time..."
 # This script assumes you are running as a sudo user or will create one.
 if [[ $(id -u) -eq 0 ]]; then
     echo "--- Running as root. Creating a non-root sudo user for best practice ---"
-    read -p "Enter a new non-root sudo username: " NEW_SUDO_USER
+    read -r -p "Enter a new non-root sudo username: " NEW_SUDO_USER
+    [[ "$NEW_SUDO_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail "Invalid Linux username."
     sudo adduser "$NEW_SUDO_USER"
     sudo usermod -aG sudo "$NEW_SUDO_USER"
     echo "User '$NEW_SUDO_USER' created. Please ensure you have SSH keys set up for this user."
@@ -69,7 +165,8 @@ echo ""
 
 # --- 4. Install LAMP Stack (Apache, MariaDB, PHP) ---
 echo "--- Installing Apache, MariaDB, PHP and essential extensions ---"
-sudo apt install apache2 mariadb-server php libapache2-mod-php php-mysql php-mbstring php-xml php-curl php-gd php-zip php-intl php-soap unzip wget -y
+sudo apt install apache2 mariadb-server php libapache2-mod-php php-mysql php-mbstring php-xml php-curl php-gd php-zip php-intl php-soap unzip wget curl ca-certificates -y
+sudo apt install php-bcmath -y
 if [ $? -ne 0 ]; then echo "Error installing LAMP stack. Exiting."; exit 1; fi
 echo "LAMP stack installed."
 echo ""
@@ -81,25 +178,19 @@ echo "--- Securing MariaDB ---"
 # This handles passwords containing single quotes, which caused the previous error.
 ESCAPED_DB_ROOT_PASS=$(printf '%s' "$DB_ROOT_PASS" | sed "s/'/''/g")
 
-# Set MariaDB root password
-sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$ESCAPED_DB_ROOT_PASS';"
+sudo mysql -u root <<MYSQL_SCRIPT
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$ESCAPED_DB_ROOT_PASS';
+MYSQL_SCRIPT
 if [ $? -ne 0 ]; then echo "Error setting MariaDB root password. Exiting."; exit 1; fi
 
 # Run mysql_secure_installation steps programmatically
 # Note: For production, consider running `mysql_secure_installation` manually for full prompts.
-# Using a temporary file for password to avoid exposing it in history/process list for subsequent commands
-echo "[client]" > ~/.my.cnf
-echo "user=root" >> ~/.my.cnf
-echo "password=$DB_ROOT_PASS" >> ~/.my.cnf
-chmod 600 ~/.my.cnf
+write_mysql_root_cnf
 
-sudo mysql --defaults-extra-file=~/.my.cnf -e "DELETE FROM mysql.user WHERE User=''; FLUSH PRIVILEGES;"
-sudo mysql --defaults-extra-file=~/.my.cnf -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'); FLUSH PRIVILEGES;"
-sudo mysql --defaults-extra-file=~/.my.cnf -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'; FLUSH PRIVILEGES;"
-sudo mysql --defaults-extra-file=~/.my.cnf -e "FLUSH PRIVILEGES;"
-
-# Clean up temporary password file
-rm ~/.my.cnf
+sudo mysql --defaults-extra-file="$MYSQL_ROOT_CNF" -e "DELETE FROM mysql.user WHERE User=''; FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file="$MYSQL_ROOT_CNF" -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'); FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file="$MYSQL_ROOT_CNF" -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'; FLUSH PRIVILEGES;"
+sudo mysql --defaults-extra-file="$MYSQL_ROOT_CNF" -e "FLUSH PRIVILEGES;"
 
 echo "MariaDB basic security measures applied."
 echo ""
@@ -109,10 +200,10 @@ echo "--- Creating database and user for CiviCRM/WordPress ---"
 # Escape single quotes in the CiviCRM/WordPress database password for SQL syntax
 ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
 
-sudo mysql -u root -p"$DB_ROOT_PASS" <<MYSQL_SCRIPT
-CREATE DATABASE $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+sudo mysql --defaults-extra-file="$MYSQL_ROOT_CNF" <<MYSQL_SCRIPT
+CREATE DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$ESCAPED_DB_PASS';
-GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER, CREATE ROUTINE, ALTER ROUTINE, REFERENCES, CREATE VIEW, SHOW VIEW ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 MYSQL_SCRIPT
 if [ $? -ne 0 ]; then echo "Error creating database or user. Exiting."; exit 1; fi
@@ -121,9 +212,7 @@ echo ""
 
 # --- 7. Install WP-CLI ---
 echo "--- Installing WP-CLI ---"
-curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-chmod +x wp-cli.phar
-sudo mv wp-cli.phar /usr/local/bin/wp
+download_wp_cli
 if [ $? -ne 0 ]; then echo "Error installing WP-CLI. Exiting."; exit 1; fi
 echo "WP-CLI installed."
 echo ""
@@ -141,10 +230,10 @@ sudo chown -R www-data:www-data "$WORDPRESS_DIR"
 sudo find "$WORDPRESS_DIR" -type d -exec chmod 755 {} \;
 sudo find "$WORDPRESS_DIR" -type f -exec chmod 644 {} \;
 
-sudo wp config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --path="$WORDPRESS_DIR" --allow-root
+printf '%s\n' "$DB_PASS" | sudo wp config create --dbname="$DB_NAME" --dbuser="$DB_USER" --path="$WORDPRESS_DIR" --allow-root --prompt=dbpass
 if [ $? -ne 0 ]; then echo "Error creating WordPress config. Exiting."; exit 1; fi
 
-sudo wp core install --url="http://$DOMAIN_OR_IP" --title="$WP_SITE_TITLE" --admin_user="$WP_ADMIN_USER" --admin_password="$WP_ADMIN_PASS" --admin_email="$WP_ADMIN_EMAIL" --path="$WORDPRESS_DIR" --allow-root
+printf '%s\n' "$WP_ADMIN_PASS" | sudo wp core install --url="http://$DOMAIN_OR_IP" --title="$WP_SITE_TITLE" --admin_user="$WP_ADMIN_USER" --admin_email="$WP_ADMIN_EMAIL" --path="$WORDPRESS_DIR" --allow-root --prompt=admin_password
 if [ $? -ne 0 ]; then echo "Error installing WordPress core. Exiting."; exit 1; fi
 echo "WordPress installed and configured."
 echo ""
@@ -185,20 +274,19 @@ echo ""
 
 # --- 10. Install CiviCRM ---
 echo "--- Installing CiviCRM ---"
-echo "Attempting to find latest CiviCRM WordPress download URL..."
-LATEST_CIVICRM_WP_URL=$(curl -s https://civicrm.org/download | grep -oP 'https:\/\/download\.civicrm\.org\/civicrm-[\d\.]+-wordpress\.zip' | head -n 1)
-
-if [ -z "$LATEST_CIVICRM_WP_URL" ]; then
-    echo "WARNING: Could not automatically find the latest CiviCRM WordPress download URL. Please manually update the script or download it yourself."
-    echo "Using a placeholder URL, this step might fail. Visit https://civicrm.org/download to get the correct URL."
-    CIVICRM_DL_URL="https://download.civicrm.org/civicrm-UNKNOWN-wordpress.zip" # Fallback
-else
-    CIVICRM_DL_URL="$LATEST_CIVICRM_WP_URL"
-    echo "Found latest CiviCRM WordPress URL: $CIVICRM_DL_URL"
+echo "Attempting to find latest CiviCRM stable version..."
+CIVICRM_VERSION=$(curl -fsSL https://civicrm.org/download | grep -oE 'Download CiviCRM [0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $3}' || true)
+if [ -z "$CIVICRM_VERSION" ]; then
+    fail "Could not automatically find the latest CiviCRM version. Visit https://civicrm.org/download and update this script."
 fi
+CIVICRM_RELEASE_BASE="https://download.civicrm.org/release/$CIVICRM_VERSION"
+CIVICRM_DL_URL="$CIVICRM_RELEASE_BASE/civicrm-$CIVICRM_VERSION-wordpress.zip"
+CIVICRM_SHA_URL="$CIVICRM_RELEASE_BASE/civicrm-$CIVICRM_VERSION.SHA256SUMS"
+echo "Found latest CiviCRM stable version: $CIVICRM_VERSION"
 
 cd /tmp
-wget "$CIVICRM_DL_URL" -O civicrm.zip
+rm -rf /tmp/civicrm /tmp/civicrm.zip
+download_with_sha256 "$CIVICRM_DL_URL" "$CIVICRM_SHA_URL" "civicrm-$CIVICRM_VERSION-wordpress.zip" /tmp/civicrm.zip
 if [ $? -ne 0 ]; then echo "Error downloading CiviCRM. Please check the URL ($CIVICRM_DL_URL). Exiting."; exit 1; fi
 unzip civicrm.zip
 sudo mv civicrm "$WORDPRESS_DIR"/wp-content/plugins/
@@ -218,21 +306,15 @@ echo ""
 echo "--- Installing CiviCRM via Command Line Tool (cv) ---"
 
 # Install cv (CiviCRM Command Line Tool)
-wget https://download.civicrm.org/cv/cv.phar -O /tmp/cv.phar
+curl -fsSL https://download.civicrm.org/cv/cv.phar -o /tmp/cv.phar
 chmod +x /tmp/cv.phar
 sudo mv /tmp/cv.phar /usr/local/bin/cv
 echo "CiviCRM CLI tool (cv) installed."
 
 # Run CiviCRM installation using cv
 echo "Running CiviCRM installation..."
-sudo -u www-data /usr/local/bin/cv core:install \
-    --cms-base-url="http://$DOMAIN_OR_IP" \
-    --db-name="$DB_NAME" \
-    --db-user="$DB_USER" \
-    --db-pass="$DB_PASS" \
-    --cms-type=WordPress \
-    --path="$WORDPRESS_DIR" \
-    --allow-root # Allow root for the script context, cv itself runs as www-data
+(cd "$WORDPRESS_DIR" && sudo -u www-data /usr/local/bin/cv core:install \
+    --cms-base-url="http://$DOMAIN_OR_IP")
 if [ $? -ne 0 ]; then echo "Error installing CiviCRM core via cv. Exiting."; exit 1; fi
 echo "CiviCRM core installation completed."
 echo ""
@@ -246,7 +328,7 @@ sudo wp config set DISABLE_XML_RPC true --path="$WORDPRESS_DIR" --allow-root
 echo "WordPress XML-RPC disabled."
 
 # PHP Hardening (modify php.ini)
-PHP_INI_PATH=$(find /etc/php/ -name php.ini | grep apache2 | head -n 1) # Find the correct php.ini for Apache
+PHP_INI_PATH=$(find /etc/php/ -name php.ini | grep apache2 | head -n 1 || true) # Find the correct php.ini for Apache
 if [ -f "$PHP_INI_PATH" ]; then
     echo "Modifying PHP configuration at $PHP_INI_PATH"
     sudo sed -i 's/display_errors = On/display_errors = Off/' "$PHP_INI_PATH"
@@ -273,7 +355,7 @@ sudo sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' "$SSH_CONFIG"
 sudo sed -i 's/^PermitRootLogin prohibit-password/PermitRootLogin no/' "$SSH_CONFIG" # for newer configs
 
 # Disable password authentication if requested
-if [[ "$DISABLE_SSH_PASSWORD" =~ ^[Yy][Ee][Ss]$ ]]; then
+if is_yes "$DISABLE_SSH_PASSWORD"; then
     sudo sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$SSH_CONFIG"
     sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' "$SSH_CONFIG"
     echo "SSH password authentication disabled. Ensure you have SSH keys for non-root users."
@@ -282,7 +364,7 @@ else
 fi
 
 # Change SSH port if requested
-if [[ "$CHANGE_SSH_PORT" =~ ^[Yy][Ee][Ss]$ && "$NEW_SSH_PORT" -ne 22 ]]; then
+if is_yes "$CHANGE_SSH_PORT" && [[ "$NEW_SSH_PORT" -ne 22 ]]; then
     if ! grep -q "^Port $NEW_SSH_PORT" "$SSH_CONFIG"; then
         sudo sed -i "s/^#Port 22/Port $NEW_SSH_PORT/" "$SSH_CONFIG"
         sudo sed -i "s/^Port 22/Port $NEW_SSH_PORT/" "$SSH_CONFIG"
@@ -310,6 +392,7 @@ sudo ufw default allow outgoing # Allow all outbound by default for now, can be 
 if [[ "$SSH_TRUSTED_IPS" != "" ]]; then
     IFS=',' read -ra ADDRS <<< "$SSH_TRUSTED_IPS"
     for ip in "${ADDRS[@]}"; do
+        ip="${ip//[[:space:]]/}"
         sudo ufw allow from "$ip" to any port "$NEW_SSH_PORT" comment "Allow SSH from trusted IP: $ip"
     done
     echo "UFW: SSH allowed from trusted IPs on port $NEW_SSH_PORT."
@@ -352,7 +435,7 @@ echo ""
 echo "WordPress Admin Dashboard:"
 echo "http://$DOMAIN_OR_IP/wp-admin"
 echo "Username: $WP_ADMIN_USER"
-echo "Password: $WP_ADMIN_PASS"
+echo "Password: (not displayed; use the password entered during setup)"
 echo ""
 echo "CiviCRM can be accessed from within your WordPress Admin Dashboard."
 echo ""
@@ -372,8 +455,8 @@ echo "    *STRONGLY RECOMMENDED*: Do NOT expose SSH directly to the internet, ev
 echo "4.  **MULTI-FACTOR AUTHENTICATION (MFA):**"
 echo "    * **SSH:** Implement MFA for all SSH logins (e.g., using Google Authenticator PAM module, YubiKey). This is a critical defense against credential compromise."
 echo "    * **WordPress/CiviCRM:** Enforce MFA for all administrative users. Use WordPress security plugins that offer MFA functionality."
-echo "5.  **PRINCIPLE OF LEAST PRIVILEGE FOR DATABASE USER:**"
-echo "    The current database user has 'ALL PRIVILEGES'. For production, you *MUST* scope down permissions to only the necessary `SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER, CREATE ROUTINE, ALTER ROUTINE, REFERENCES, CREATE VIEW, SHOW VIEW` on the specific CiviCRM database. Remove `DROP`, `ALTER`, `CREATE DATABASE` if not explicitly needed by CiviCRM at runtime."
+echo "5.  **DATABASE PRIVILEGES:**"
+echo "    The database user was granted CiviCRM's documented database-level privileges on only the configured database. Review whether your production lifecycle allows separating install/upgrade privileges from day-to-day runtime privileges."
 echo "6.  **FILE INTEGRITY MONITORING (FIM):**"
 echo "    Deploy FIM tools (e.g., AIDE, OSSEC) to monitor critical system and web application files for unauthorized changes. This helps detect persistent threats."
 echo "7.  **WEB APPLICATION FIREWALL (WAF):**"
